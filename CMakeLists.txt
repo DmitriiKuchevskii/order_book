@@ -11,7 +11,7 @@ set(CMAKE_CXX_STANDARD 17)
 find_package(Threads REQUIRED)
 link_libraries(Threads::Threads)
 
-add_compile_options(-Wall -pedantic -Werror -mavx -march=native)
+add_compile_options(-Wall -pedantic -Werror -mavx -march=native -fconcepts)
 
 if (CMAKE_BUILD_TYPE STREQUAL "Debug")
     add_compile_options(-O0 -g3)
