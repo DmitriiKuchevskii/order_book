@@ -1,0 +1,12 @@
+# Ignore everything
+*
+
+# But not these files...
+!.gitignore
+!CMakeLists.txt
+!test
+!test/*
+!book
+!book/*
+!README.txt
+!setup.sh
