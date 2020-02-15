@@ -5,8 +5,8 @@
 !.gitignore
 !CMakeLists.txt
 !test
-!test/*
+!test/**
 !book
-!book/*
+!book/**
 !README.txt
 !setup.sh
