@@ -9,7 +9,7 @@ endif()
 set(CMAKE_CXX_STANDARD 17)
 
 find_package(Threads REQUIRED)
-link_libraries(Threads::Threads)
+link_libraries(Threads::Threads uuid)
 
 add_compile_options(-Wall -pedantic -Werror -mavx -march=native -fconcepts)
 

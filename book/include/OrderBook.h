@@ -6,28 +6,65 @@
 #define ORDER_BOOK_ORDERBOOK_H
 
 #include <regex>
+#include <atomic>
 #include <sstream>
 #include <string>
 #include <sstream>
 #include <set>
 #include <unordered_set>
+#include <uuid/uuid.h>
 
 constexpr char BuySide = 'B';
 constexpr char SellSide = 'S';
 constexpr char PlaceAction = 'A';
 constexpr char RemoveAction = 'X';
 
+using namespace std::chrono;
+
 struct Order
 {
-    static size_t global_orders_counter;
-    char action;
+    Order(char side, size_t price, size_t qty)
+        : Order(side, price, qty,
+             []() -> size_t
+             {
+                 uuid_t uuid;
+                 uuid_generate(uuid);
+                 return std::hash<std::string_view>()(std::string_view((char*)uuid, std::size(uuid)));
+             }()
+         )
+    {}
+
+    Order(char side, size_t price, size_t qty, size_t id)
+            : side(side), price(price), qty(qty), id(id)
+    {}
+
+    Order(const Order& copy) : Order(copy.side, copy.price, copy.qty)
+    {}
+
+    Order(Order&& move) noexcept : Order(move.side, move.price, move.qty, move.id)
+    {
+        placeTime = move.placeTime;
+    }
+
+    bool operator == (const Order& other) const
+    {
+        return id == other.id;
+    }
+
     char side;
     size_t price;
     mutable size_t qty;
     size_t id;
-    size_t globalNumber;
+    size_t placeTime = duration_cast<microseconds>(steady_clock::now().time_since_epoch()).count();
 };
-size_t Order::global_orders_counter = 0;
+
+struct Trade
+{
+    size_t initOrderId;
+    size_t matchOrderId;
+    size_t executedQty;
+    size_t executedPrice;
+};
 
 std::ostream& operator << (std::ostream& os, const Order& order)
 {
@@ -35,25 +72,26 @@ std::ostream& operator << (std::ostream& os, const Order& order)
                     << "Side: " << (order.side == BuySide ? "Buy" : "Sell") << "; "
                     << "Price: " << order.price << "; "
                     << "Quantity: " << order.qty << "]";
+
 }
 
-inline Order parse_order(const std::string& line)
+inline std::pair<char, Order> parse_order(const std::string& line)
 {
-    std::vector<std::string> vals = {
+    std::vector<std::string> vals =
+    {
         std::sregex_token_iterator{line.begin(), line.end(), (const std::regex&)std::regex(","), -1}, {}
     };
 
-    return {
-          vals[0][0]
-        , vals[2][0]
+    return std::make_pair(vals[0][0],
+    Order{
+          vals[2][0]
         , std::stoull(vals[4])
         , std::stoull(vals[3])
         , std::stoull(vals[1])
-        , Order::global_orders_counter++
-    };
+    });
 }
 
-inline std::optional<Order> get_next_order(std::istream& stream)
+inline std::optional<std::pair<char, Order>> get_next_order(std::istream& stream)
 {
     std::string line;
     while (std::getline(stream, line))
@@ -65,12 +103,11 @@ inline std::optional<Order> get_next_order(std::istream& stream)
     return std::nullopt;
 }
 
-
 template <char Side, typename U = std::enable_if<Side == BuySide || Side == SellSide>>
 bool OrderBookComparator(const Order& first, const Order& second)
 {
     if (first.price == second.price)
-        return first.globalNumber < second.globalNumber;
+        return first.placeTime < second.placeTime;
 
     if constexpr (Side == BuySide)
     {
@@ -85,14 +122,22 @@ bool OrderBookComparator(const Order& first, const Order& second)
 class OrderBook
 {
 public:
-    void placeOrder(const Order& order)
+    using NewTradeListinerHandler = std::function<void(const Trade&)>;
+    using ComparatorType = std::function<bool(const Order&, const Order&)>;
+
+public:
+    template <typename OrderType>
+    void placeOrder(OrderType&& order)
     {
         std::cout << "Request to add a new order " << order << "\n";
 
-        order.side == BuySide ? placeOrder<BuySide>(order) : placeOrder<SellSide>(order);
+        order.side == BuySide ? placeOrder<BuySide>(std::forward<Order>(order)) :
+                                placeOrder<SellSide>(std::forward<Order>(order));
+
     }
 
-    void removeOrder(const Order& order)
+    template <typename OrderType>
+    void removeOrder(OrderType&& order)
     {
         std::cout << "Request to remove an order " << order << ". ";
 
@@ -114,34 +159,52 @@ public:
 
     void print() const
     {
+        std::cout << "=================\nASK";
         print<SellSide>();
+        std::cout << "\n------------";
         print<BuySide>();
+        std::cout << "\nBID\n=================\n";
     }
+
+    void addNewTradeListener(const NewTradeListinerHandler& newTradeListener)
+    {
+        m_newTradeObserver = newTradeListener;
+    }
+
+    const auto& getBids() const { return m_bids; }
+
+    const auto& getAsks() const { return m_asks; }
 
 private:
     template <char Side, typename U = std::enable_if<Side == BuySide || Side == SellSide>>
     void print() const
     {
-        std::cout << (Side == SellSide ? "=================\nASK" : "");
         size_t prevPrice = -1;
-        const auto& book = Side == BuySide ? m_asks : m_bids;
-        for (const auto& order: book)
+        auto printVal = [&prevPrice](const Order& order)
         {
             if (prevPrice != order.price)
-                std::cout << "\n" << order.price << ": ";
-
-            std::cout  << order.qty << " ";
+                std::cout << "\nPrice: " << order.price << "; Quantity: ";
+            std::cout  << order.qty << "(id: " << order.id << ") ";
             prevPrice = order.price;
+        };
+        if constexpr (Side == BuySide)
+        {
+            for (const auto& order: m_bids)
+                printVal(order);
         }
-        std::cout << (Side == SellSide ? "\n------------" : "\nBID\n=================\n");
+        else
+        {
+            for (auto it = m_asks.rbegin(); it != m_asks.rend(); ++it)
+                printVal(*it);
+        }
     }
 
-    template <char Side, typename U = std::enable_if<Side == BuySide || Side == SellSide>>
-    void placeOrder(const Order& order)
+    template <char Side, typename OrderType, typename U = std::enable_if<Side == BuySide || Side == SellSide>>
+    void placeOrder(OrderType&& order)
     {
         auto& initiatorBook = [this]() -> auto& { return Side == BuySide ? m_bids : m_asks; } ();
-        auto insertResult = initiatorBook.emplace(order);
-        m_del.emplace(order.id, insertResult.first);
+        auto insertResult = initiatorBook.emplace(std::forward<Order>(order));
+        m_del.emplace(insertResult.first->id, insertResult.first);
         if (isNewTrade())
             doTrades<Side>(initiatorBook);
     }
@@ -153,65 +216,86 @@ private:
     }
 
     template <char Side, typename U = std::enable_if<Side == BuySide || Side == SellSide>>
-    void doTrades(auto& initiatorBook)
+    void doTrades(auto& initiatorOrderBook)
     {
         constexpr const char* InitSideStr = Side == BuySide ? "Buy" : "Sell";
         constexpr const char* CounterSideStr = Side != BuySide ? "Buy" : "Sell";
 
-        auto& counter = Side == BuySide ? m_asks : m_bids;
-        auto initiator = initiatorBook.begin();
-        for (auto it = counter.begin(); it != counter.end(); )
+        auto& counterOrderBook = Side == BuySide ? m_asks : m_bids;
+        auto initiatorOrderIt = initiatorOrderBook.begin();
+        for (auto counterOrderIt = counterOrderBook.begin(); counterOrderIt != counterOrderBook.end(); )
         {
             if constexpr (Side == BuySide)
             {
-                if (initiator->price < counter.begin()->price) return;
+                if (initiatorOrderIt->price < counterOrderBook.begin()->price) return;
             }
             else
             {
-                if (initiator->price > counter.begin()->price) return;
+                if (initiatorOrderIt->price > counterOrderBook.begin()->price) return;
             }
 
-            std::cout << "Order "<< initiator->id << "(" << InitSideStr <<  ") has initialized a trade with order "
-                      << it->id << "(" << CounterSideStr << ")" << " for " << std::min(initiator->qty, it->qty)
-                      << " shares at price " << it->price << " USD. ";
+            std::cout << "Order " << initiatorOrderIt->id << "(" << InitSideStr
+                      << ") has initialized a trade with order "
+                      << counterOrderIt->id << "(" << CounterSideStr << ")" << " for "
+                      << std::min(initiatorOrderIt->qty, counterOrderIt->qty)
+                      << " shares at price " << counterOrderIt->price << " USD. ";
 
-            if (initiator->qty > it->qty)
+            if (initiatorOrderIt->qty > counterOrderIt->qty)
             {
-                initiator->qty -= it->qty;
-                m_del.erase(it->id);
-                size_t counterId = it->id;
-                it = counter.erase(it);
-                std::cout << "Order " << initiator->id << " has been partially traded (Quantity left: "
-                          << initiator->qty << "). Order " << counterId << " has been fully traded.\n";
+                size_t counterOrderId = counterOrderIt->id;
+                size_t counterOrderPrice = counterOrderIt->price;
+                size_t counterOrderQty = counterOrderIt->qty;
+                initiatorOrderIt->qty -= counterOrderQty;
+
+                m_del.erase(counterOrderId);
+                counterOrderIt = counterOrderBook.erase(counterOrderIt);
+
+                m_newTradeObserver({initiatorOrderIt->id, counterOrderId, counterOrderQty, counterOrderPrice});
+
+                std::cout << "Order " << initiatorOrderIt->id << " has been partially traded (Quantity left: "
+                          << initiatorOrderIt->qty << "). Order " << counterOrderId << " has been fully traded.\n";
                 continue;
             }
-            else if (initiator->qty == it->qty)
+            else if (initiatorOrderIt->qty == counterOrderIt->qty)
             {
-                m_del.erase(initiator->id);
-                m_del.erase(it->id);
-                initiatorBook.erase(initiator);
-                counter.erase(it);
+                size_t initiatorOrderId = initiatorOrderIt->id;
+                size_t initiatorOrderQty = initiatorOrderIt->qty;
+                size_t counterOrderId = counterOrderIt->id;
+                size_t counterOrderPrice = counterOrderIt->price;
+
+                m_del.erase(initiatorOrderId);
+                m_del.erase(counterOrderId);
+                initiatorOrderBook.erase(initiatorOrderIt);
+                counterOrderBook.erase(counterOrderIt);
+
+                m_newTradeObserver({initiatorOrderId, counterOrderId, initiatorOrderQty, counterOrderPrice});
+
                 std::cout << "Both orders have been fully traded.\n";
-                return;
             }
-            else // initiator->qty < it->qty
+            else // initiatorOrderIt->qty < counterOrderIt->qty
             {
-                it->qty -= initiator->qty;
-                m_del.erase(initiator->id);
-                size_t initId = initiator->id;
-                initiatorBook.erase(initiator);
-                std::cout << "Order " << initId << " has been fully traded. Order "
-                          << it->id << " has been partially traded (Quantity left: " << it->qty << ")\n";
-                return;
+                counterOrderIt->qty -= initiatorOrderIt->qty;
+                size_t initiatorOrderId = initiatorOrderIt->id;
+                size_t initiatorOrderQty = initiatorOrderIt->qty;
+
+                m_del.erase(initiatorOrderId);
+                initiatorOrderBook.erase(initiatorOrderIt);
+
+                m_newTradeObserver({initiatorOrderId, counterOrderIt->id, initiatorOrderQty, counterOrderIt->price});
+
+                std::cout << "Order " << initiatorOrderId << " has been fully traded. Order "
+                          << counterOrderIt->id << " has been partially traded (Quantity left: "
+                          << counterOrderIt->qty << ")\n";
             }
+            return;
         }
     }
 
 private:
-    using ComparatorType = std::function<bool(const Order&, const Order&)>;
     std::set<Order, ComparatorType> m_bids{OrderBookComparator<BuySide>};
     std::set<Order, ComparatorType> m_asks{OrderBookComparator<SellSide>};
     std::unordered_map<size_t, decltype(m_bids)::const_iterator> m_del;
+    NewTradeListinerHandler m_newTradeObserver = [](const Trade&){};
 };
 
 
